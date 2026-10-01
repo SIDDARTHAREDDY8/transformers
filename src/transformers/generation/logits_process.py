@@ -472,12 +472,24 @@ class EncoderRepetitionPenaltyLogitsProcessor(LogitsProcessor):
 
     @add_start_docstrings(LOGITS_PROCESSOR_INPUTS_DOCSTRING)
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        score = torch.gather(scores, 1, self.encoder_input_ids)
+        # The number of score rows can exceed the number of source rows when each source is expanded into
+        # multiple hypotheses (e.g. beam search or `num_return_sequences > 1`). `generate` expands the batch
+        # with `repeat_interleave`, so every block of consecutive hypotheses belongs to one source row: remap the
+        # source ids the same way so that each hypothesis is penalized against its own encoder input.
+        num_source_rows = self.encoder_input_ids.shape[0]
+        if scores.shape[0] % num_source_rows != 0:
+            raise ValueError(
+                f"`scores` has {scores.shape[0]} rows but `encoder_input_ids` has {num_source_rows} rows: the "
+                "number of hypotheses must be a multiple of the number of source rows."
+            )
+        encoder_input_ids = self.encoder_input_ids.repeat_interleave(scores.shape[0] // num_source_rows, dim=0)
+
+        score = torch.gather(scores, 1, encoder_input_ids)
 
         # if score < 0 then hallucination penalty has to be multiplied to increase the token probabilities
         score = torch.where(score < 0, score * self.penalty, score / self.penalty)
 
-        scores_processed = scores.scatter(1, self.encoder_input_ids, score)
+        scores_processed = scores.scatter(1, encoder_input_ids, score)
         return scores_processed
 
 

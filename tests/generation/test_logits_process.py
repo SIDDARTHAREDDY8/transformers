@@ -285,6 +285,42 @@ class LogitsProcessorTest(unittest.TestCase):
         # processor should not change logits in-place
         self.assertFalse(torch.all(scores == processed_scores))
 
+    def test_encoder_repetition_penalty_dist_process_with_hypothesis_expansion(self):
+        # Regression test for https://github.com/huggingface/transformers/issues/49233: when each source row is
+        # expanded into multiple hypotheses (beam search, `num_return_sequences > 1`), every hypothesis row must
+        # be penalized against its own source row's tokens -- not against another source's tokens, and not left
+        # unpenalized.
+        source = torch.tensor([[1, 3], [4, 5]], device=torch_device, dtype=torch.long)
+        expansion = 2
+
+        # one score row per hypothesis, as `generate` passes them after beam/sampled-return expansion
+        scores = torch.arange(1, 9, device=torch_device, dtype=torch.float).repeat(source.shape[0] * expansion, 1)
+
+        rep_penalty_proc = EncoderRepetitionPenaltyLogitsProcessor(penalty=2.0, encoder_input_ids=source)
+
+        processed_scores = rep_penalty_proc(
+            torch.zeros(source.shape[0] * expansion, 1, device=torch_device, dtype=torch.long), scores
+        )
+
+        # expected: each hypothesis penalized against its own source row (repeat_interleave ordering)
+        expected_scores = scores.clone()
+        for row, tokens in enumerate(source.repeat_interleave(expansion, dim=0)):
+            for token in tokens.unique().tolist():
+                value = expected_scores[row, token]
+                expected_scores[row, token] = value / 2.0 if value < 0 else value * 2.0
+
+        self.assertTrue(torch.allclose(processed_scores, expected_scores))
+
+        # check that values not in the source ids were NOT changed
+        self.assertAlmostEqual(processed_scores[0, 6].item(), scores[0, 6].item())
+        self.assertAlmostEqual(processed_scores[2, 1].item(), scores[2, 1].item())
+
+        # the cached source ids must not be mutated by the expansion
+        self.assertEqual(rep_penalty_proc.encoder_input_ids.shape[0], source.shape[0])
+
+        # processor should not change logits in-place
+        self.assertFalse(torch.all(scores == processed_scores))
+
     def test_top_k_dist_warper(self):
         input_ids = None
         vocab_size = 10
